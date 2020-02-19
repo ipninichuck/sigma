@@ -380,6 +380,12 @@ class KibanaBackend(ElasticsearchQuerystringBackend, MultiRuleOutputMixin):
 
     def generate(self, sigmaparser):
         description = sigmaparser.parsedyaml.setdefault("description", "")
+        false_positives = sigmaparser.parsedyaml.setdefault("falsepositives", "")
+        level = sigmaparser.parsedyaml.setdefault("level", "")
+        tags = sigmaparser.parsedyaml.setdefault("tags", "")
+        # Get time frame if exists
+        interval = sigmaparser.parsedyaml["detection"].setdefault("timeframe", "30m")
+        dateField = self.sigmaconfig.config.get("dateField", "timestamp")
 
         columns = list()
         try:
@@ -417,42 +423,21 @@ class KibanaBackend(ElasticsearchQuerystringBackend, MultiRuleOutputMixin):
                             )
                         )
                 self.kibanaconf.append({
-                        "_id": rulename,
-                        "_type": "search",
-                        "_source": {
-                            "title": title,
-                            "description": description,
-                            "hits": 0,
-                            "columns": columns,
-                            "sort": ["@timestamp", "desc"],
-                            "version": 1,
-                            "kibanaSavedObjectMeta": {
-                                "searchSourceJSON": {
-                                    "index": index,
-                                    "filter":  [],
-                                    "highlight": {
-                                        "pre_tags": ["@kibana-highlighted-field@"],
-                                        "post_tags": ["@/kibana-highlighted-field@"],
-                                        "fields": { "*":{} },
-                                        "require_field_match": False,
-                                        "fragment_size": 2147483647
-                                        },
-                                    "query": {
-                                        "query_string": {
-                                            "query": result,
-                                            "analyze_wildcard": True
-                                            }
-                                        }
-                                    }
-                            }
-                        }
-                    })
+                        "risk_score": "50",
+                        "severity": level,
+                        "type": "query",
+                        "name": title,
+                        "description": description,
+                        "version": 1,
+                        "query": result
+                                    })
+
+
 
     def finalize(self):
         if self.output_type == "import":        # output format that can be imported via Kibana UI
-            for item in self.kibanaconf:    # JSONize kibanaSavedObjectMeta.searchSourceJSON
-                item['_source']['kibanaSavedObjectMeta']['searchSourceJSON'] = json.dumps(item['_source']['kibanaSavedObjectMeta']['searchSourceJSON'])
             return json.dumps(self.kibanaconf, indent=2)
+
         elif self.output_type == "curl":
             for item in self.indexsearch:
                 return item
@@ -487,7 +472,7 @@ class XPackWatcherBackend(ElasticsearchQuerystringBackend, MultiRuleOutputMixin)
             ("filter_range","30m","Watcher time filter",None),
 
             ("alert_methods", "email", "Alert method(s) to use when the rule triggers, comma separated. Supported: " + ', '.join(supported_alert_methods), None),
-            # Options for Email Action            
+            # Options for Email Action
             ("mail", "root@localhost", "Mail address for Watcher notification (only logging if not set)", None),
 
             # Options for WebHook Action
@@ -504,7 +489,7 @@ class XPackWatcherBackend(ElasticsearchQuerystringBackend, MultiRuleOutputMixin)
             # Options for Index Action
             ("index", "<log2alert-{now/d}>","Index name used to add the alerts", None), #by default it creates a new index every day
             ("type", "_doc","Index Type used to add the alerts", None)
-        
+
             )
     watcher_urls = {
             "watcher": "_watcher",
@@ -526,7 +511,7 @@ class XPackWatcherBackend(ElasticsearchQuerystringBackend, MultiRuleOutputMixin)
         # Get time frame if exists
         interval = sigmaparser.parsedyaml["detection"].setdefault("timeframe", "30m")
         dateField = self.sigmaconfig.config.get("dateField", "timestamp")
-        
+
         # creating condition
         indices = sigmaparser.get_logsource().index
         # How many results to be returned. Usually 0 but for index action we need it.
@@ -629,7 +614,7 @@ class XPackWatcherBackend(ElasticsearchQuerystringBackend, MultiRuleOutputMixin)
                 eaction={} #email action
                 waction={} #webhook action
                 iaction={} #index action
-                action={} 
+                action={}
                 alert_methods = self.alert_methods.split(',')
                 if 'email' in alert_methods:
                     # mail notification if mail address is given
@@ -663,7 +648,7 @@ class XPackWatcherBackend(ElasticsearchQuerystringBackend, MultiRuleOutputMixin)
                     waction = {
             "httppost":{
                             "transform":{
-                                "script": "ctx.metadata.timestamp=ctx.trigger.scheduled_time;" 
+                                "script": "ctx.metadata.timestamp=ctx.trigger.scheduled_time;"
                                 },
                             "webhook":{
                             "scheme"  : http_scheme,
@@ -698,12 +683,12 @@ class XPackWatcherBackend(ElasticsearchQuerystringBackend, MultiRuleOutputMixin)
                     size=1000 #I presume it will not be more than 1000 events detected
                     iaction = {
                             "elastic":{
-                                "transform":{ #adding title, description, tags on the event 
+                                "transform":{ #adding title, description, tags on the event
                                     "script": "ctx.payload.transform = [];for (int j=0;j<ctx.payload.hits.total;j++){ctx.payload.hits.hits[j]._source.alerttimestamp=ctx.trigger.scheduled_time;ctx.payload.hits.hits[j]._source.alerttitle=ctx.metadata.title;ctx.payload.hits.hits[j]._source.alertquery=ctx.metadata.query;ctx.payload.hits.hits[j]._source.alertdescription=ctx.metadata.description;ctx.payload.hits.hits[j]._source.tags=ctx.metadata.tags;ctx.payload.transform.add(ctx.payload.hits.hits[j]._source)} return ['_doc': ctx.payload.transform];"
                                 },
                                 "index":{
                                     "index": index,
-                                    "doc_type":dtype 
+                                    "doc_type":dtype
                                 }
                             }
                     }
@@ -725,7 +710,7 @@ class XPackWatcherBackend(ElasticsearchQuerystringBackend, MultiRuleOutputMixin)
                                   "description": description,
                                   "tags": tags,
                                   "query":result #addede query to metadata. very useful in kibana to do drill down directly from discover
-                              },     
+                              },
                               "trigger": {
                                 "schedule": {
                                   "interval": interval  # how often the watcher should check
@@ -991,4 +976,3 @@ class ElastalertBackendQs(ElastalertBackend, ElasticsearchQuerystringBackend):
     def generateQuery(self, parsed):
         #Generate ES QS Query
         return [{ 'query' : { 'query_string' : { 'query' : super().generateQuery(parsed) } } }]
-
