@@ -380,12 +380,6 @@ class KibanaBackend(ElasticsearchQuerystringBackend, MultiRuleOutputMixin):
 
     def generate(self, sigmaparser):
         description = sigmaparser.parsedyaml.setdefault("description", "")
-        false_positives = sigmaparser.parsedyaml.setdefault("falsepositives", "")
-        level = sigmaparser.parsedyaml.setdefault("level", "")
-        tags = sigmaparser.parsedyaml.setdefault("tags", "")
-        # Get time frame if exists
-        interval = sigmaparser.parsedyaml["detection"].setdefault("timeframe", "30m")
-        dateField = self.sigmaconfig.config.get("dateField", "timestamp")
 
         columns = list()
         try:
@@ -423,21 +417,42 @@ class KibanaBackend(ElasticsearchQuerystringBackend, MultiRuleOutputMixin):
                             )
                         )
                 self.kibanaconf.append({
-                        "risk_score": "50",
-                        "severity": level,
-                        "type": "query",
-                        "name": title,
-                        "description": description,
-                        "version": 1,
-                        "query": result
-                                    })
-
-
+                        "_id": rulename,
+                        "_type": "search",
+                        "_source": {
+                            "title": title,
+                            "description": description,
+                            "hits": 0,
+                            "columns": columns,
+                            "sort": ["@timestamp", "desc"],
+                            "version": 1,
+                            "kibanaSavedObjectMeta": {
+                                "searchSourceJSON": {
+                                    "index": index,
+                                    "filter":  [],
+                                    "highlight": {
+                                        "pre_tags": ["@kibana-highlighted-field@"],
+                                        "post_tags": ["@/kibana-highlighted-field@"],
+                                        "fields": { "*":{} },
+                                        "require_field_match": False,
+                                        "fragment_size": 2147483647
+                                        },
+                                    "query": {
+                                        "query_string": {
+                                            "query": result,
+                                            "analyze_wildcard": True
+                                            }
+                                        }
+                                    }
+                            }
+                        }
+                    })
 
     def finalize(self):
         if self.output_type == "import":        # output format that can be imported via Kibana UI
+            for item in self.kibanaconf:    # JSONize kibanaSavedObjectMeta.searchSourceJSON
+                item['_source']['kibanaSavedObjectMeta']['searchSourceJSON'] = json.dumps(item['_source']['kibanaSavedObjectMeta']['searchSourceJSON'])
             return json.dumps(self.kibanaconf, indent=2)
-
         elif self.output_type == "curl":
             for item in self.indexsearch:
                 return item
@@ -456,6 +471,104 @@ class KibanaBackend(ElasticsearchQuerystringBackend, MultiRuleOutputMixin):
                         )
         else:
             raise NotImplementedError("Output type '%s' not supported" % self.output_type)
+
+    def index_variable_name(self, index):
+        return "index_" + index.replace("-", "__").replace("*", "X")
+
+class esdetectionbackend(ElasticsearchQuerystringBackend, MultiRuleOutputMixin):
+    """Converts Sigma rule into elastic detection engine rules."""
+    identifier = "es-detection"
+    active = True
+    options = ElasticsearchQuerystringBackend.options + (
+            ("kibana", "localhost:5601", "Host and port of Elasticsearch instance", None), #If you want a specific Kibana Space Please add /s/spacename to your kibana URL
+            ("output", "import", "Output format: import = JSON file manually imported in Kibana, curl = Shell script that imports queries in Kibana via curl (jq is additionally required)", "output_type"),
+            ("lang", "kql", "eql", None), #Query Languages available
+            ("index", ".kibana", "Kibana index", None), #Index Should not be changed. Will Remove in future version.
+            ("prefix", "Sigma: ", "Title prefix of Sigma queries", None),
+            )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.kibanaconf = list()
+        self.indexsearch = set()
+
+    def generate(self, sigmaparser):
+        description = sigmaparser.parsedyaml.setdefault("description", "")
+        false_positives = sigmaparser.parsedyaml.setdefault("falsepositives", "")
+        author = sigmaparser.parsedyaml.setdefault("author", "")
+        level = sigmaparser.parsedyaml.setdefault("level", "")
+        tags = sigmaparser.parsedyaml.setdefault("tags", "")
+        # Get time frame if exists
+        interval = sigmaparser.parsedyaml["detection"].setdefault("timeframe", "30m")
+        dateField = self.sigmaconfig.config.get("dateField", "timestamp")
+
+        columns = list()
+        try:
+            for field in sigmaparser.parsedyaml["fields"]:
+                mapped = sigmaparser.config.get_fieldmapping(field).resolve_fieldname(field, sigmaparser)
+                if type(mapped) == str:
+                    columns.append(mapped)
+                elif type(mapped) == list:
+                    columns.extend(mapped)
+                else:
+                    raise TypeError("Field mapping must return string or list")
+        except KeyError:    # no 'fields' attribute
+            pass
+
+        indices = sigmaparser.get_logsource().index
+        if len(indices) == 0:   # fallback if no index is given
+            indices = ["*"]
+
+        for parsed in sigmaparser.condparsed:
+            result = self.generateNode(parsed.parsedSearch)
+
+            for index in indices:
+                rulename = self.getRuleName(sigmaparser)
+                if len(indices) > 1:     # add index names if rule must be replicated because of ambigiuous index patterns
+                    raise NotSupportedError("Multiple target indices are not supported by Kibana")
+                else:
+                    title = self.prefix + sigmaparser.parsedyaml["title"]
+
+        risk = 50 #Assigns risk value based on a simple relation(Quarters) to severity
+        if level == "low":
+           risk = 25
+        elif level == "medium":
+           risk = 50
+        elif level == "high":
+           risk = 75
+        elif level == "critical":
+           risk = 100
+        else:
+           risk = 50
+
+
+        #Modified to match Elastic Detection Rule format
+        self.kibanaconf.append({
+                "risk_score": risk,
+                "severity": level,
+                "type": "query",
+                "name": title,
+                "description": description,
+                "tags": f"author: {author}",
+                "version": 1,
+                "query": result
+                            })
+
+
+
+    def finalize(self):
+        if self.lang == "kql":        # output format that uses Kibana Query Language
+         if self.output_type == "import":        # output format that can be imported via Kibana UI
+           return json.dumps(self.kibanaconf, indent=2)[1:-1]
+         elif self.output_type == "curl": #Output format using curl to upload rules
+                  for item in self.kibanaconf:
+                     return "curl -s -X POST "{kibana}/api/detection_engine/rules" -H 'kbn-xsrf: true' -H 'Content-Type: application/json' -d\' <<EOF\n{doc}\nEOF".format(
+                            kibana=self.kibana,
+                            doc=json.dumps(self.kibanaconf, indent=2)[1:-1])
+
+        elif self.lang == "eql": #At this time EQL is not supported but will be soon. Also no actions are available as of yet.
+            raise NotImplementedError("EQL is not supported")
+
 
     def index_variable_name(self, index):
         return "index_" + index.replace("-", "__").replace("*", "X")

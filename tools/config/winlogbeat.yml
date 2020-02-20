@@ -1,6 +1,7 @@
 title: Elastic Winlogbeat (from 7.x) index pattern and field mapping
 order: 20
 backends:
+  - es-detection
   - es-qs
   - es-dsl
   - kibana
